@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	kcmconfig "github.com/flant/addon-operator/pkg/kube_config_manager/config"
 	"github.com/flant/addon-operator/pkg/module_manager/models/hooks"
 	"github.com/flant/addon-operator/pkg/utils"
 	"github.com/flant/shell-operator/pkg/hook/controller"
@@ -115,7 +116,9 @@ func TestHookErrorsSummary(t *testing.T) {
 
 type noopConfigManager struct{}
 
-func (*noopConfigManager) SaveConfigValues(string, utils.Values) error { return nil }
+func (*noopConfigManager) CommitConfigValues(string, utils.Values, *utils.ValuesPatch) (*kcmconfig.CommitResult, error) {
+	return &kcmconfig.CommitResult{}, nil
+}
 
 type noopValuesGetter struct{}
 

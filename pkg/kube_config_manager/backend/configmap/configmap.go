@@ -64,63 +64,19 @@ func (b Backend) LoadConfig(ctx context.Context, _ ...string) (*config.KubeConfi
 		return nil, nil
 	}
 
-	return parseConfigMapData(obj.Data)
-}
-
-// SaveConfigValues saves patches in the ConfigMap
-func (b Backend) SaveConfigValues(ctx context.Context, key string, values utils.Values) ( /*checksum*/ string, error) {
-	if key == utils.GlobalValuesKey {
-		return b.saveGlobalConfigValues(ctx, values)
+	cfg, err := parseConfigMapData(obj.Data)
+	if err != nil {
+		return nil, err
 	}
 
-	return b.saveModuleConfigValues(ctx, key, values)
-}
+	cfg.ResourceVersion = obj.ResourceVersion
+	cfg.LastCommits = commitIDsFromAnnotations(obj.Annotations)
 
-func (b Backend) saveGlobalConfigValues(ctx context.Context, values utils.Values) ( /*checksum*/ string, error) {
-	globalKubeConfig := &config.GlobalKubeConfig{
-		Values:   values,
-		Checksum: values.Checksum(),
-	}
-
-	if b.isDebugEnabled(ctx) {
-		b.logger.Info("Save global values to ConfigMap",
-			slog.String(pkg.LogKeyName, b.name),
-			slog.String(pkg.LogKeyValues, values.DebugString()))
-	} else {
-		b.logger.Info("Save global values to ConfigMap", slog.String(pkg.LogKeyName, b.name))
-	}
-
-	err := b.mergeValues(ctx, "global", globalKubeConfig.GetValues())
-
-	return globalKubeConfig.Checksum, err
+	return cfg, nil
 }
 
 func (b Backend) isDebugEnabled(ctx context.Context) bool {
 	return kcmcontext.IsKubeConfigManagerDebug(ctx)
-}
-
-// saveModuleConfigValues updates module section in ConfigMap.
-// It uses knownChecksums to prevent KubeConfigChanged event on self-update.
-func (b Backend) saveModuleConfigValues(ctx context.Context, moduleName string, values utils.Values) ( /*checksum*/ string, error) {
-	moduleKubeConfig := &config.ModuleKubeConfig{
-		ModuleConfig: *utils.NewModuleConfig(moduleName, values),
-		Checksum:     values.Checksum(),
-	}
-
-	if b.isDebugEnabled(ctx) {
-		b.logger.Info("Save module values to ConfigMap",
-			slog.String(pkg.LogKeyModuleName, moduleName),
-			slog.String(pkg.LogKeyConfigMapName, b.name),
-			slog.String(pkg.LogKeyValues, values.DebugString()))
-	} else {
-		b.logger.Info("Save module values to ConfigMap",
-			slog.String(pkg.LogKeyModuleName, moduleName),
-			slog.String(pkg.LogKeyConfigMapName, b.name))
-	}
-
-	err := b.mergeValues(ctx, utils.ModuleNameToValuesKey(moduleName), moduleKubeConfig.GetValues()) //nolint: staticcheck,nolintlint
-
-	return moduleKubeConfig.Checksum, err
 }
 
 func (b Backend) getConfigMap(ctx context.Context) (*v1.ConfigMap, error) {
@@ -296,53 +252,6 @@ func fromConfigMapData(moduleName string, configData map[string]string) (*utils.
 	return mc.LoadFromValues(configValues)
 }
 
-func (b Backend) mergeValues(ctx context.Context, moduleName string, values utils.Values) error {
-	return b.updateConfigMap(ctx, func(obj *v1.ConfigMap) error {
-		data, err := yaml.Marshal(values)
-		if err != nil {
-			return err
-		}
-
-		obj.Data[moduleName] = string(data)
-
-		return nil
-	})
-}
-
-func (b Backend) updateConfigMap(ctx context.Context, transformFn func(*v1.ConfigMap) error) error {
-	var err error
-
-	obj, err := b.getConfigMap(ctx)
-	if err != nil {
-		return nil
-	}
-
-	isUpdate := true
-
-	if obj == nil {
-		obj = &v1.ConfigMap{}
-		obj.Name = b.name
-		isUpdate = false
-	}
-
-	if obj.Data == nil {
-		obj.Data = make(map[string]string)
-	}
-
-	err = transformFn(obj)
-	if err != nil {
-		return err
-	}
-
-	if isUpdate {
-		_, err = b.client.CoreV1().ConfigMaps(b.namespace).Update(ctx, obj, metav1.UpdateOptions{})
-	} else {
-		_, err = b.client.CoreV1().ConfigMaps(b.namespace).Create(ctx, obj, metav1.CreateOptions{})
-	}
-
-	return err
-}
-
 func (b Backend) StartInformer(ctx context.Context, eventC chan config.Event) {
 	// define resyncPeriod for informer
 	resyncPeriod := time.Duration(5) * time.Minute
@@ -426,6 +335,9 @@ func (b Backend) handleConfigMapEvent(obj *v1.ConfigMap, eventC chan config.Even
 
 		return err
 	}
+
+	newConfig.ResourceVersion = obj.ResourceVersion
+	newConfig.LastCommits = commitIDsFromAnnotations(obj.Annotations)
 
 	eventC <- config.Event{Key: "batch", Config: newConfig}
 

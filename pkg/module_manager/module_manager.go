@@ -83,7 +83,7 @@ type DirectoryConfig struct {
 }
 
 type KubeConfigManager interface {
-	SaveConfigValues(key string, values utils.Values) error
+	CommitConfigValues(key string, values utils.Values, patch *utils.ValuesPatch) (*config.CommitResult, error)
 	IsModuleEnabled(moduleName string) *bool
 	UpdateModuleConfig(moduleName string) error
 	SafeReadConfig(handler func(config *config.KubeConfig))

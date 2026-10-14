@@ -6,6 +6,7 @@ import (
 	metricoperation "github.com/deckhouse/deckhouse/pkg/metrics-storage/operation"
 	sdkpkg "github.com/deckhouse/module-sdk/pkg"
 
+	kcmconfig "github.com/flant/addon-operator/pkg/kube_config_manager/config"
 	environmentmanager "github.com/flant/addon-operator/pkg/module_manager/environment_manager"
 	gohook "github.com/flant/addon-operator/pkg/module_manager/go_hook"
 	"github.com/flant/addon-operator/pkg/module_manager/models/hooks/kind"
@@ -20,7 +21,7 @@ type hooksMetricsStorage interface {
 }
 
 type kubeConfigManager interface {
-	SaveConfigValues(moduleName string, configValuesPatch utils.Values) error
+	CommitConfigValues(moduleName string, values utils.Values, patch *utils.ValuesPatch) (*kcmconfig.CommitResult, error)
 }
 
 type metricStorage interface {

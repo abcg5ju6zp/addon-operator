@@ -37,6 +37,9 @@ type KubeConfigManager struct {
 
 	m             sync.Mutex
 	currentConfig *config.KubeConfig
+
+	// Tracked hook writebacks with their read baselines, targets and stages.
+	commits *commitRegistry
 }
 
 func NewKubeConfigManager(ctx context.Context, bk backend.ConfigHandler, runtimeConfig *runtimeConfig.Config, logger *log.Logger) *KubeConfigManager {
@@ -70,6 +73,7 @@ func NewKubeConfigManager(ctx context.Context, bk backend.ConfigHandler, runtime
 
 		currentConfig:  config.NewConfig(),
 		knownChecksums: NewChecksums(),
+		commits:        newCommitRegistry(),
 		configEventCh:  make(chan config.KubeConfigEvent, 1),
 		logger:         logger,
 		backend:        bk,
@@ -97,23 +101,15 @@ func (kcm *KubeConfigManager) Init() error {
 	return nil
 }
 
-// SaveConfigValues updates `global` or `module` section in ConfigMap.
-// It uses knownChecksums to prevent KubeConfigChanged event on self-update.
+// SaveConfigValues updates `global` or `module` section in the backend.
+// It is a whole-section writeback without hook-path conflict detection:
+// concurrent remote changes are still merged at section granularity and
+// self-update events are suppressed via checksums. Hook flows should use
+// CommitConfigValues with the emitted patch instead.
 func (kcm *KubeConfigManager) SaveConfigValues(key string, values utils.Values) error {
-	checksum, err := kcm.backend.SaveConfigValues(kcm.ctx, key, values)
-	if err != nil {
-		kcm.withLock(func() {
-			kcm.knownChecksums.Remove(key, checksum)
-		})
+	_, err := kcm.CommitConfigValues(key, values, nil)
 
-		return err
-	}
-
-	kcm.withLock(func() {
-		kcm.knownChecksums.Add(key, checksum)
-	})
-
-	return nil
+	return err
 }
 
 // KubeConfigEventCh return a channel that emits new KubeConfig on ConfigMap changes in global section or enabled modules.
@@ -156,6 +152,16 @@ func (kcm *KubeConfigManager) loadConfig() error {
 	}
 
 	kcm.currentConfig = newConfig
+
+	// Recover unfinished commit stages: the resource annotations identify the
+	// last committed sections and the snapshot was just loaded from the same
+	// resource, so in-memory state already equals the persisted version. The
+	// startup converge re-runs hooks and restores missed triggers.
+	for _, key := range kcm.commits.recover(newConfig) {
+		kcm.logger.Info("Recovered unfinished config commit from backend resource",
+			slog.String(pkg.LogKeyKey, key),
+			slog.String(pkg.LogKeyRevision, newConfig.ResourceVersion))
+	}
 
 	return nil
 }
@@ -230,6 +236,7 @@ func (kcm *KubeConfigManager) handleConfigEvent(obj config.Event) {
 		// Config backend was reset
 		kcm.m.Lock()
 		kcm.currentConfig = config.NewConfig()
+		kcm.commits.reset()
 		kcm.m.Unlock()
 
 		kcm.configEventCh <- config.KubeConfigEvent{
@@ -364,6 +371,7 @@ func (kcm *KubeConfigManager) handleBatchConfigEvent(obj config.Event) {
 		// Config backend was reset
 		kcm.m.Lock()
 		kcm.currentConfig = config.NewConfig()
+		kcm.commits.reset()
 		kcm.m.Unlock()
 
 		kcm.configEventCh <- config.KubeConfigEvent{
@@ -445,6 +453,8 @@ func (kcm *KubeConfigManager) handleBatchConfigEvent(obj config.Event) {
 
 	// Update state after successful parsing.
 	kcm.currentConfig = newConfig
+	// Drop committed entries once the watcher confirms their checksums.
+	kcm.commits.observe(newConfig)
 	kcm.m.Unlock()
 
 	// Fire event if ConfigMap has changes.

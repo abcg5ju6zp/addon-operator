@@ -1229,7 +1229,11 @@ func (bm *BasicModule) executeHook(ctx context.Context, h *hooks.ModuleHook, bin
 				)
 			}
 
-			err := bm.dc.KubeConfigManager.SaveConfigValues(bm.GetName(), configValuesPatchResult.Values)
+			commitResult, err := bm.dc.KubeConfigManager.CommitConfigValues(
+				bm.GetName(),
+				configValuesPatchResult.Values,
+				&configValuesPatchResult.ValuesPatch,
+			)
 			if err != nil {
 				logEntry.Debug("Module hook kube module config values stay unchanged",
 					slog.String(pkg.LogKeyModule, h.GetName()),
@@ -1238,12 +1242,24 @@ func (bm *BasicModule) executeHook(ctx context.Context, h *hooks.ModuleHook, bin
 				return fmt.Errorf("module hook '%s': set kube module config failed: %s", h.GetName(), err)
 			}
 
-			bm.valuesStorage.SaveConfigValues(newValues)
+			if commitResult.RemoteDiverged() {
+				// Remote content no longer matches the hook target (same-path
+				// conflict or merged external changes on other paths). Do not
+				// apply the target in memory: the manager published a change
+				// event, so remote values are reapplied (with schema
+				// validation) and the module hooks are scheduled to run again.
+				logEntry.Info("Module hook config values diverged from the concurrent remote state, syncing remote content",
+					slog.String(pkg.LogKeyHook, h.GetName()),
+					slog.String(pkg.LogKeyModule, bm.GetName()),
+					slog.Any(pkg.LogKeyPaths, commitResult.ConflictPaths))
+			} else {
+				bm.valuesStorage.SaveConfigValues(newValues)
 
-			logEntry.Debug("Module hook: kube module config values updated",
-				slog.String(pkg.LogKeyHook, h.GetName()),
-				slog.String(pkg.LogKeyModule, bm.GetName()),
-				slog.String(pkg.LogKeyValues, bm.valuesStorage.GetConfigValues(false).DebugString()))
+				logEntry.Debug("Module hook: kube module config values updated",
+					slog.String(pkg.LogKeyHook, h.GetName()),
+					slog.String(pkg.LogKeyModule, bm.GetName()),
+					slog.String(pkg.LogKeyValues, bm.valuesStorage.GetConfigValues(false).DebugString()))
+			}
 		}
 	}
 

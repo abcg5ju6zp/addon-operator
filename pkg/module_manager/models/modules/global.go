@@ -252,7 +252,11 @@ func (gm *GlobalModule) executeHook(ctx context.Context, h *hooks.GlobalHook, bi
 				return fmt.Errorf("cannot apply config values patch for global values: %w", validationErr)
 			}
 
-			err := gm.dc.KubeConfigManager.SaveConfigValues(utils.GlobalValuesKey, configValuesPatchResult.Values)
+			commitResult, err := gm.dc.KubeConfigManager.CommitConfigValues(
+				utils.GlobalValuesKey,
+				configValuesPatchResult.Values,
+				&configValuesPatchResult.ValuesPatch,
+			)
 			if err != nil {
 				logEntry.Debug("Global hook kube config global values stay unchanged",
 					slog.String(pkg.LogKeyHook, h.GetName()),
@@ -261,11 +265,21 @@ func (gm *GlobalModule) executeHook(ctx context.Context, h *hooks.GlobalHook, bi
 				return fmt.Errorf("global hook '%s': set kube config failed: %s", h.GetName(), err)
 			}
 
-			gm.valuesStorage.SaveConfigValues(newValues)
+			if commitResult.RemoteDiverged() {
+				// Remote content no longer matches the hook target: keep the
+				// target out of in-memory values, the manager event reapplies
+				// remote values (with schema validation) and reruns the global
+				// hooks.
+				logEntry.Info("Global hook config values diverged from the concurrent remote state, syncing remote content",
+					slog.String(pkg.LogKeyHook, h.GetName()),
+					slog.Any(pkg.LogKeyPaths, commitResult.ConflictPaths))
+			} else {
+				gm.valuesStorage.SaveConfigValues(newValues)
 
-			logEntry.Debug("Global hook: kube config global values updated", slog.String(pkg.LogKeyHook, h.GetName()))
-			logEntry.Debug("New kube config global values",
-				slog.String(pkg.LogKeyValues, gm.valuesStorage.GetConfigValues(false).DebugString()))
+				logEntry.Debug("Global hook: kube config global values updated", slog.String(pkg.LogKeyHook, h.GetName()))
+				logEntry.Debug("New kube config global values",
+					slog.String(pkg.LogKeyValues, gm.valuesStorage.GetConfigValues(false).DebugString()))
+			}
 		}
 
 		// Apply patches for *Enabled keys.
