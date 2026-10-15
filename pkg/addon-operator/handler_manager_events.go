@@ -44,6 +44,18 @@ func (op *AddonOperator) RegisterManagerEventsHandlers() {
 			pkg.LogKeyBinding: string(htypes.OnKubernetesEvent),
 		}
 		logEntry := utils.EnrichLoggerWithLabels(op.Logger, logLabels)
+
+		// Freeze gate: while an execution owns the monitor of the event, the
+		// event must not enter a queue. It is buffered and replayed with the
+		// latest facts when the last owner releases.
+		if op.FreezeRegistry != nil && op.FreezeRegistry.HoldKubeEvent(kubeEvent) {
+			logEntry.Debug("Hold kubernetes event while monitor is frozen",
+				slog.String("monitor_id", kubeEvent.MonitorId),
+				slog.String(pkg.LogKeyEvent, kubeEvent.String()))
+
+			return nil
+		}
+
 		logEntry.Debug("Create tasks for 'kubernetes' event",
 			slog.String(pkg.LogKeyEvent, kubeEvent.String()))
 

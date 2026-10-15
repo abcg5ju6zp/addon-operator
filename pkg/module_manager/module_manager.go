@@ -817,9 +817,11 @@ func (mm *ModuleManager) RunModule(ctx context.Context, moduleName string, logLa
 		pkg.LogKeyQueue:  "main",
 	})
 
-	// Hooks can delete release resources, so pause resources monitor before run hooks.
-	mm.dependencies.HelmResourcesManager.PauseMonitor(bm.GetName())
-	defer mm.dependencies.HelmResourcesManager.ResumeMonitor(bm.GetName())
+	// Resource watching for the module is frozen by the ModuleRun task
+	// (freeze ownership registry) for the whole beforeHelm/Helm/afterHelm
+	// sequence, including parallel and nested executions. Do not pause the
+	// monitor directly here: plain pause/resume calls race across
+	// overlapping executions and may resume the watch ahead of time.
 
 	var err error
 

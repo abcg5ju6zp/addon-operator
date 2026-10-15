@@ -22,6 +22,7 @@ import (
 	"github.com/flant/addon-operator/pkg/module_manager/models/hooks"
 	"github.com/flant/addon-operator/pkg/module_manager/models/modules"
 	"github.com/flant/addon-operator/pkg/task"
+	"github.com/flant/addon-operator/pkg/task/freeze"
 	"github.com/flant/addon-operator/pkg/task/helpers"
 	taskqueue "github.com/flant/addon-operator/pkg/task/queue"
 	"github.com/flant/addon-operator/pkg/utils"
@@ -41,6 +42,7 @@ type TaskDependencies interface {
 	GetModuleManager() *module_manager.ModuleManager
 	GetMetricStorage() metricsstorage.Storage
 	GetQueueService() *taskqueue.Service
+	GetFreezeRegistry() *freeze.Registry
 }
 
 // RegisterTaskHandler creates a factory function for ModuleRun tasks
@@ -52,6 +54,7 @@ func RegisterTaskHandler(svc TaskDependencies) func(t sh_task.Task, logger *log.
 			svc.GetModuleManager(),
 			svc.GetMetricStorage(),
 			svc.GetQueueService(),
+			svc.GetFreezeRegistry(),
 			logger.Named("module-run"),
 		)
 	}
@@ -64,6 +67,7 @@ type Task struct {
 	moduleManager     *module_manager.ModuleManager
 	metricStorage     metricsstorage.Storage
 	queueService      *taskqueue.Service
+	freezeRegistry    *freeze.Registry
 	logger            *log.Logger
 }
 
@@ -74,6 +78,7 @@ func NewTask(
 	moduleManager *module_manager.ModuleManager,
 	metricStorage metricsstorage.Storage,
 	queueService *taskqueue.Service,
+	freezeRegistry *freeze.Registry,
 	logger *log.Logger,
 ) *Task {
 	return &Task{
@@ -82,6 +87,7 @@ func NewTask(
 		moduleManager:     moduleManager,
 		metricStorage:     metricStorage,
 		queueService:      queueService,
+		freezeRegistry:    freezeRegistry,
 		logger:            logger,
 	}
 }
@@ -439,6 +445,35 @@ func (s *Task) Handle(ctx context.Context) (res queue.TaskResult) { //nolint:non
 		span.AddEvent("module can run helm")
 
 		s.logger.Debug("ModuleRun phase", slog.String(pkg.LogKeyPhase, string(baseModule.GetPhase())))
+
+		// Freeze the module resources monitor for the whole Helm phase.
+		// Ownership is per attempt: parallel ModuleRun tasks for different
+		// modules hold independent scopes, overlapping executions of the
+		// same module share a reference count, and failure/retry releases
+		// only this attempt. Release runs before the outer deferred closure
+		// queues the restarting ModuleRun task.
+		var ownership *freeze.Ownership
+		if s.freezeRegistry != nil {
+			ownership = s.freezeRegistry.Acquire(freeze.Execution{
+				TaskID:  s.shellTask.GetId(),
+				Queue:   s.shellTask.GetQueueName(),
+				Attempt: uint64(s.shellTask.GetFailureCount()) + 1,
+				Reason:  taskName,
+				Scope: freeze.Scope{
+					Modules: []string{hm.ModuleName},
+				},
+			})
+
+			defer func() {
+				outcome := freeze.OutcomeSucceeded
+				if moduleRunErr != nil {
+					outcome = freeze.OutcomeFailed
+				}
+
+				ownership.Release(ctx, outcome)
+			}()
+		}
+
 		// run beforeHelm, helm, afterHelm
 		valuesChanged, moduleRunErr = s.moduleManager.RunModule(ctx, baseModule.GetName(), s.shellTask.GetLogLabels())
 	}

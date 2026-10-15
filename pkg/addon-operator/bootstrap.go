@@ -58,6 +58,7 @@ func (op *AddonOperator) bootstrap() error {
 		KubeConfigManager:    op.KubeConfigManager,
 		ConvergeState:        op.ConvergeState,
 		CRDExtraLabels:       op.CRDExtraLabels,
+		FreezeRegistry:       op.FreezeRegistry,
 	}
 
 	op.TaskService = taskservice.NewTaskHandlerService(op.ctx, cfg, op.Logger)

@@ -16,6 +16,7 @@ import (
 	"github.com/flant/addon-operator/pkg/module_manager"
 	"github.com/flant/addon-operator/pkg/task"
 	discovercrds "github.com/flant/addon-operator/pkg/task/discover-crds"
+	"github.com/flant/addon-operator/pkg/task/freeze"
 	"github.com/flant/addon-operator/pkg/task/functional"
 	"github.com/flant/addon-operator/pkg/task/helpers"
 	paralleltask "github.com/flant/addon-operator/pkg/task/parallel"
@@ -51,6 +52,7 @@ type TaskHandlerServiceConfig struct {
 	KubeConfigManager    *kube_config_manager.KubeConfigManager
 	ConvergeState        *converge.ConvergeState
 	CRDExtraLabels       map[string]string
+	FreezeRegistry       *freeze.Registry
 }
 
 type TaskHandlerService struct {
@@ -82,6 +84,10 @@ type TaskHandlerService struct {
 	// like heritage=addon-operator
 	crdExtraLabels map[string]string
 
+	// freezeRegistry owns scoped resource-watch freezes during hook and
+	// module executions.
+	freezeRegistry *freeze.Registry
+
 	// discoveredCRDs is a concurrent map of discovered CRDs
 	discoveredCRDs *discovercrds.DiscoveredGVKs
 
@@ -103,6 +109,7 @@ func NewTaskHandlerService(ctx context.Context, config *TaskHandlerServiceConfig
 		kubeConfigManager:    config.KubeConfigManager,
 		convergeState:        config.ConvergeState,
 		crdExtraLabels:       config.CRDExtraLabels,
+		freezeRegistry:       config.FreezeRegistry,
 		discoveredCRDs:       discovercrds.NewDiscoveredGVKs(),
 		logger:               logger,
 	}
@@ -288,6 +295,13 @@ func (s *TaskHandlerService) GetConvergeState() *converge.ConvergeState {
 
 func (s *TaskHandlerService) GetCRDExtraLabels() map[string]string {
 	return s.crdExtraLabels
+}
+
+// GetFreezeRegistry returns the registry of scoped resource-watch freeze
+// ownership. It may be nil in lightweight test setups; task handlers must
+// tolerate that.
+func (s *TaskHandlerService) GetFreezeRegistry() *freeze.Registry {
+	return s.freezeRegistry
 }
 
 func (s *TaskHandlerService) GetTaskFactory() map[sh_task.TaskType]func(t sh_task.Task, logger *log.Logger) task.Task {

@@ -40,7 +40,9 @@ type ResourceMonitorConfig struct {
 type ResourcesMonitor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	paused bool
+
+	pauseMu sync.Mutex
+	paused  bool
 
 	moduleName       string
 	manifests        []manifest.Manifest
@@ -97,7 +99,7 @@ func (r *ResourcesMonitor) Start() {
 		for {
 			select {
 			case <-timer.C:
-				if r.paused {
+				if r.IsPaused() {
 					continue
 				}
 				// Check release status
@@ -157,12 +159,30 @@ func (r *ResourcesMonitor) GetHelmReleaseStatus(moduleName string) (string, erro
 
 // Pause prevent execution of absent callback
 func (r *ResourcesMonitor) Pause() {
+	r.pauseMu.Lock()
 	r.paused = true
+	r.pauseMu.Unlock()
 }
 
 // Resume allows execution of absent callback
 func (r *ResourcesMonitor) Resume() {
+	r.pauseMu.Lock()
 	r.paused = false
+	r.pauseMu.Unlock()
+}
+
+// IsPaused reports whether the absent callback is currently disabled.
+func (r *ResourcesMonitor) IsPaused() bool {
+	r.pauseMu.Lock()
+	defer r.pauseMu.Unlock()
+
+	return r.paused
+}
+
+// DefaultNamespace returns the namespace used as fallback for namespaceless
+// manifests.
+func (r *ResourcesMonitor) DefaultNamespace() string {
+	return r.defaultNamespace
 }
 
 func (r *ResourcesMonitor) AbsentResources() ([]manifest.Manifest, error) {

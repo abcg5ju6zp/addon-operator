@@ -11,10 +11,11 @@ import (
 
 	"github.com/flant/addon-operator/pkg"
 	"github.com/flant/addon-operator/pkg/addon-operator/converge"
-	"github.com/flant/addon-operator/pkg/helm_resources_manager"
 	"github.com/flant/addon-operator/pkg/metrics"
 	"github.com/flant/addon-operator/pkg/module_manager"
+	"github.com/flant/addon-operator/pkg/module_manager/models/hooks"
 	"github.com/flant/addon-operator/pkg/task"
+	"github.com/flant/addon-operator/pkg/task/freeze"
 	"github.com/flant/addon-operator/pkg/task/helpers"
 	taskqueue "github.com/flant/addon-operator/pkg/task/queue"
 	htypes "github.com/flant/shell-operator/pkg/hook/types"
@@ -29,10 +30,10 @@ const (
 
 // TaskDependencies defines the interface for accessing necessary components
 type TaskDependencies interface {
-	GetHelmResourcesManager() helm_resources_manager.HelmResourcesManager
 	GetModuleManager() *module_manager.ModuleManager
 	GetMetricStorage() metricsstorage.Storage
 	GetQueueService() *taskqueue.Service
+	GetFreezeRegistry() *freeze.Registry
 }
 
 // RegisterTaskHandler creates a factory function for ModuleHookRun tasks
@@ -41,10 +42,10 @@ func RegisterTaskHandler(svc TaskDependencies) func(t sh_task.Task, logger *log.
 		return NewTask(
 			t,
 			helpers.IsOperatorStartupTask(t),
-			svc.GetHelmResourcesManager(),
 			svc.GetModuleManager(),
 			svc.GetMetricStorage(),
 			svc.GetQueueService(),
+			svc.GetFreezeRegistry(),
 			logger.Named("module-hook-run"),
 		)
 	}
@@ -55,10 +56,10 @@ type Task struct {
 	shellTask         sh_task.Task
 	isOperatorStartup bool
 
-	helmResourcesManager helm_resources_manager.HelmResourcesManager
-	moduleManager        *module_manager.ModuleManager
-	metricStorage        metricsstorage.Storage
-	queueService         *taskqueue.Service
+	moduleManager  *module_manager.ModuleManager
+	metricStorage  metricsstorage.Storage
+	queueService   *taskqueue.Service
+	freezeRegistry *freeze.Registry
 
 	logger *log.Logger
 }
@@ -67,20 +68,20 @@ type Task struct {
 func NewTask(
 	shellTask sh_task.Task,
 	isOperatorStartup bool,
-	helmResourcesManager helm_resources_manager.HelmResourcesManager,
 	moduleManager *module_manager.ModuleManager,
 	metricStorage metricsstorage.Storage,
 	queueService *taskqueue.Service,
+	freezeRegistry *freeze.Registry,
 	logger *log.Logger,
 ) *Task {
 	return &Task{
-		shellTask:            shellTask,
-		isOperatorStartup:    isOperatorStartup,
-		helmResourcesManager: helmResourcesManager,
-		moduleManager:        moduleManager,
-		metricStorage:        metricStorage,
-		queueService:         queueService,
-		logger:               logger,
+		shellTask:         shellTask,
+		isOperatorStartup: isOperatorStartup,
+		moduleManager:     moduleManager,
+		metricStorage:     metricStorage,
+		queueService:      queueService,
+		freezeRegistry:    freezeRegistry,
+		logger:            logger,
 	}
 }
 
@@ -188,13 +189,23 @@ func (s *Task) Handle(ctx context.Context) queue.TaskResult {
 	}
 
 	if shouldRunHook {
-		// Module hook can recreate helm objects, so pause resources monitor.
-		// Parallel hooks can interfere, so pause-resume only for hooks in the main queue.
-		// FIXME pause-resume for parallel hooks
-		if s.shellTask.GetQueueName() == "main" {
-			s.helmResourcesManager.PauseMonitor(hm.ModuleName)
-			defer s.helmResourcesManager.ResumeMonitor(hm.ModuleName)
-		}
+		// A module hook may recreate Helm objects or modify values, so its
+		// module monitor and its Kubernetes binding monitors are frozen for
+		// the duration of this execution. Ownership is scoped per attempt
+		// and reference counted: hooks in parallel queues and nested runs
+		// each hold their own references; the watch resumes only after the
+		// last valid execution ends, then accumulated facts are reconciled.
+		ownership := s.acquireFreeze(hm, taskHook)
+
+		freezeOutcome := freeze.OutcomeRetrying
+
+		defer func() {
+			// Panic safety net: a normal flow releases explicitly below,
+			// before the Synchronization unlock.
+			if ownership != nil && !ownership.Released() {
+				ownership.Release(ctx, freezeOutcome)
+			}
+		}()
 
 		errors := 0.0
 		success := 0.0
@@ -300,6 +311,20 @@ func (s *Task) Handle(ctx context.Context) queue.TaskResult {
 		s.metricStorage.CounterAdd(metrics.ModuleHookAllowedErrorsTotal, allowed, metricLabels)
 		s.metricStorage.CounterAdd(metrics.ModuleHookErrorsTotal, errors, metricLabels)
 		s.metricStorage.CounterAdd(metrics.ModuleHookSuccessTotal, success, metricLabels)
+
+		// Release before the Synchronization unlock below so events flushed
+		// by the informers no longer take the freeze detour.
+		if res.Status == queue.Fail {
+			freezeOutcome = freeze.OutcomeFailed
+		} else if res.Status == queue.Success {
+			freezeOutcome = freeze.OutcomeSucceeded
+		} else {
+			freezeOutcome = freeze.OutcomeRetrying
+		}
+
+		if ownership != nil {
+			ownership.Release(ctx, freezeOutcome)
+		}
 	}
 
 	if isSynchronization && res.Status == queue.Success {
@@ -313,6 +338,58 @@ func (s *Task) Handle(ctx context.Context) queue.TaskResult {
 	}
 
 	return res
+}
+
+// acquireFreeze registers freeze ownership for the module and the monitors
+// this hook execution can actually affect. It returns nil when freeze
+// tracking is not wired (lightweight tests), in which case original
+// non-frozen behavior is preserved.
+func (s *Task) acquireFreeze(hm task.HookMetadata, taskHook *hooks.ModuleHook) *freeze.Ownership {
+	if s.freezeRegistry == nil {
+		return nil
+	}
+
+	scope := freeze.Scope{
+		Modules: []string{hm.ModuleName},
+	}
+
+	if hm.BindingType == htypes.OnKubernetesEvent {
+		scope.MonitorIDs = HookMonitorIDs(taskHook, hm.Binding)
+	}
+
+	attempt := uint64(s.shellTask.GetFailureCount()) + 1
+
+	return s.freezeRegistry.Acquire(freeze.Execution{
+		TaskID:  s.shellTask.GetId(),
+		Queue:   s.shellTask.GetQueueName(),
+		Attempt: attempt,
+		Reason:  taskName,
+		Scope:   scope,
+	})
+}
+
+// HookMonitorIDs resolves the kube binding monitor IDs of a module hook.
+// When the binding name is known (a Kubernetes event task), the scope is
+// narrowed to that binding; otherwise all kube bindings of the hook are
+// returned. Exported for freeze ownership rebuild after a restart.
+func HookMonitorIDs(taskHook *hooks.ModuleHook, bindingName string) []string {
+	if taskHook == nil {
+		return nil
+	}
+
+	var ids []string
+
+	for _, cfg := range taskHook.GetHookConfig().OnKubernetesEvents {
+		if bindingName != "" && cfg.BindingName != bindingName {
+			continue
+		}
+
+		if cfg.Monitor != nil && cfg.Monitor.Metadata.MonitorId != "" {
+			ids = append(ids, cfg.Monitor.Metadata.MonitorId)
+		}
+	}
+
+	return ids
 }
 
 // logTaskAdd prints info about queued tasks.

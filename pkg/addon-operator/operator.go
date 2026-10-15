@@ -27,6 +27,7 @@ import (
 	"github.com/flant/addon-operator/pkg/module_manager/models/hooks/kind"
 	"github.com/flant/addon-operator/pkg/module_manager/models/modules/events"
 	"github.com/flant/addon-operator/pkg/task"
+	"github.com/flant/addon-operator/pkg/task/freeze"
 	paralleltask "github.com/flant/addon-operator/pkg/task/parallel"
 	queueutils "github.com/flant/addon-operator/pkg/task/queue"
 	taskservice "github.com/flant/addon-operator/pkg/task/service"
@@ -103,6 +104,10 @@ type AddonOperator struct {
 	ConvergeState *converge.ConvergeState
 
 	TaskService *taskservice.TaskHandlerService
+
+	// FreezeRegistry owns scoped resource-watch freezes during hook and
+	// module executions.
+	FreezeRegistry *freeze.Registry
 }
 
 type Option func(operator *AddonOperator)
@@ -373,6 +378,11 @@ func (op *AddonOperator) Setup() error {
 	op.Helm = helmClient
 	op.HelmResourcesManager = helmResourcesManager
 
+	// Registry for scoped freeze ownership used by hook and module tasks.
+	// Created here so the Kubernetes event handler (registered during
+	// InitModuleManager) can gate events from the first converge on.
+	op.FreezeRegistry = freeze.NewRegistry(newFreezeControls(op), op.Logger.Named("freeze"))
+
 	globalHooksDir, err := fileUtils.RequireExistingDirectory(app.GlobalHooksDir)
 	if err != nil {
 		return fmt.Errorf("global hooks directory: %s", err)
@@ -437,6 +447,11 @@ func (op *AddonOperator) Start(ctx context.Context) error {
 
 	// Bootstrap main queue with tasks to run Startup process.
 	op.BootstrapMainQueue(op.engine.TaskQueues)
+
+	// Reconcile freeze ownership with queued tasks, synchronization state
+	// and live monitor pause state before any queue worker starts.
+	op.rebuildFreezeOwnership()
+
 	// Start main task queue handler
 	op.engine.TaskQueues.StartMain(ctx)
 	// Precreate queues for parallel tasks
