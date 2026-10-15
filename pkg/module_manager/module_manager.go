@@ -139,6 +139,10 @@ type ModuleManager struct {
 
 	environmentManager *environmentmanager.Manager
 
+	// monitorPublisher owns the independent monitor-publish recovery
+	// transactions that run after a confirmed Helm run.
+	monitorPublisher *MonitorPublisher
+
 	logger *log.Logger
 
 	l sync.Mutex
@@ -181,6 +185,13 @@ func NewModuleManager(ctx context.Context, cfg *ModuleManagerConfig, logger *log
 	if len(cfg.DirectoryConfig.ChrootDir) > 0 {
 		mm.environmentManager = environmentmanager.NewManager(cfg.DirectoryConfig.ChrootDir, mm.logger)
 	}
+
+	mm.monitorPublisher = NewMonitorPublisher(
+		cfg.Dependencies.HelmResourcesManager,
+		mm,
+		mm.helmReleaseStatus,
+		logger,
+	)
 
 	return mm
 }
@@ -739,6 +750,8 @@ func (mm *ModuleManager) DeleteModule(ctx context.Context, moduleName string, lo
 
 		// Stop resources monitor before deleting release
 		mm.dependencies.HelmResourcesManager.StopMonitor(ml.GetName())
+		// Drop any pending monitor-publish transaction for the removed release.
+		mm.monitorPublisher.Discard(ml.GetName())
 		schemaStorage := ml.GetValuesStorage().GetSchemaStorage()
 		// Module has chart, but there is no release -> log a warning.
 		// Module has chart and release -> execute helm delete.
@@ -802,8 +815,24 @@ func (mm *ModuleManager) DeleteModule(ctx context.Context, moduleName string, lo
 	return ml.DisassembleEnvironmentForModule()
 }
 
-// RunModule runs beforeHelm hook, helm upgrade --install and afterHelm or afterDeleteHelm hook
-func (mm *ModuleManager) RunModule(ctx context.Context, moduleName string, logLabels map[string]string) ( /*valuesChanged*/ bool, error) {
+// RunModuleResult is the outcome of a confirmed module run.
+type RunModuleResult struct {
+	// ValuesChanged is true when afterHelm hooks changed values; the task
+	// queues another ModuleRun in that case.
+	ValuesChanged bool
+	// NeedsMonitor is true when a Helm release exists whose resources monitor
+	// must be published (EnsureMonitor phase) before the module is Ready.
+	NeedsMonitor bool
+}
+
+// RunModule runs beforeHelm hook, helm upgrade --install and afterHelm or afterDeleteHelm hook.
+//
+// Publishing the resources monitor is deliberately NOT part of the module run:
+// RunHelmInstall only produces the release and returns the claim
+// (revision/checksum/manifests) registered with the monitor publisher. The
+// monitor is published afterwards in the independent EnsureMonitor recovery
+// phase, so a monitor failure never re-runs the confirmed Helm side effects.
+func (mm *ModuleManager) RunModule(ctx context.Context, moduleName string, logLabels map[string]string) (RunModuleResult, error) {
 	ctx, span := otel.Tracer(moduleManagerServiceName).Start(ctx, "RunModule")
 	defer span.End()
 
@@ -829,7 +858,7 @@ func (mm *ModuleManager) RunModule(ctx context.Context, moduleName string, logLa
 	treg.End()
 
 	if err != nil {
-		return false, fmt.Errorf("run hooks by binding: %w", err)
+		return RunModuleResult{}, fmt.Errorf("run hooks by binding: %w", err)
 	}
 
 	treg = trace.StartRegion(ctx, "ModuleRun-HelmPhase-helm")
@@ -843,24 +872,26 @@ func (mm *ModuleManager) RunModule(ctx context.Context, moduleName string, logLa
 
 	helmModule, err := modules.NewHelmModule(bm, mm.defaultNamespace, mm.TempDir, deps, schemaStorage, modules.WithLogger(mm.logger.Named("helm-module")))
 	if err != nil && !errors.Is(err, modules.ErrModuleIsNotHelm) {
-		return false, fmt.Errorf("helm module create: %w", err)
+		return RunModuleResult{}, fmt.Errorf("helm module create: %w", err)
 	}
 
+	var helmResult *modules.HelmRunResult
+
 	if err == nil {
-		err = helmModule.RunHelmInstall(ctx, logLabels, bm.GetMaintenanceState())
-		if err != nil && errors.Is(err, modules.ErrReleaseIsUnmanaged) {
+		helmResult, err = helmModule.RunHelmInstall(ctx, logLabels, bm.GetMaintenanceState())
+		if errors.Is(err, modules.ErrReleaseIsUnmanaged) {
 			bm.SetUnmanaged()
 			mm.dependencies.HelmResourcesManager.StopMonitor(moduleName)
+			mm.monitorPublisher.Discard(moduleName)
 
+			helmResult = nil
 			err = nil
+		} else if err != nil {
+			return RunModuleResult{}, fmt.Errorf("run helm install: %w", err)
 		}
 	}
 
 	treg.End()
-
-	if err != nil && !errors.Is(err, modules.ErrModuleIsNotHelm) {
-		return false, fmt.Errorf("run helm install: %w", err)
-	}
 
 	oldValues := bm.GetValues(false)
 	oldValuesChecksum := oldValues.Checksum()
@@ -870,14 +901,87 @@ func (mm *ModuleManager) RunModule(ctx context.Context, moduleName string, logLa
 	treg.End()
 
 	if err != nil {
-		return false, fmt.Errorf("run hooks by binding: %w", err)
+		return RunModuleResult{}, fmt.Errorf("run hooks by binding: %w", err)
 	}
 
 	newValues := bm.GetValues(false)
 	newValuesChecksum := newValues.Checksum()
 
+	valuesChanged := oldValuesChecksum != newValuesChecksum
+
+	// Register the monitor-publish recovery transaction for the current
+	// release. A later RunModule (e.g. afterHelm changed values) simply
+	// re-claims it for the newer revision.
+	if helmResult != nil {
+		mm.monitorPublisher.Claim(moduleName, helmResult)
+	}
+
 	// Do not send to mm.moduleValuesChanged, changed values are handled by TaskHandler.
-	return oldValuesChecksum != newValuesChecksum, nil
+	return RunModuleResult{
+		ValuesChanged: valuesChanged,
+		NeedsMonitor:  helmResult != nil,
+	}, nil
+}
+
+// EnsureModuleMonitor publishes the resources monitor for the release produced
+// by the last confirmed RunModule and blocks until it is confirmed to observe
+// that release. It only touches monitor publishing: manifest parsing, monitor
+// replacement and watch startup. Helm, beforeHelm and afterHelm are never
+// re-run from here.
+func (mm *ModuleManager) EnsureModuleMonitor(ctx context.Context, moduleName string) error {
+	ctx, span := otel.Tracer(moduleManagerServiceName).Start(ctx, "EnsureModuleMonitor")
+	defer span.End()
+
+	if err := mm.monitorPublisher.Publish(ctx, moduleName); err != nil {
+		return fmt.Errorf("publish resources monitor: %w", err)
+	}
+
+	return nil
+}
+
+// FetchMonitorClaim renders the module chart and reads the live release
+// revision without any Helm mutation. It lets the monitor publisher re-anchor
+// ("re-fetch manifest") a transaction that is missing or targets a revision
+// other than the live release. A nil result means the module is not a Helm
+// chart and has no monitor to publish.
+func (mm *ModuleManager) FetchMonitorClaim(moduleName string) (*modules.HelmRunResult, error) {
+	bm := mm.GetModule(moduleName)
+	if bm == nil {
+		return nil, fmt.Errorf("module %q not found", moduleName)
+	}
+
+	schemaStorage := bm.GetValuesStorage().GetSchemaStorage()
+	deps := &modules.HelmModuleDependencies{
+		HelmClientFactory:   mm.dependencies.Helm,
+		HelmResourceManager: mm.dependencies.HelmResourcesManager,
+		MetricsStorage:      mm.dependencies.MetricStorage,
+		HelmValuesValidator: schemaStorage,
+	}
+
+	helmModule, err := modules.NewHelmModule(bm, mm.defaultNamespace, mm.TempDir, deps, schemaStorage, modules.WithLogger(mm.logger.Named("helm-module")))
+	if errors.Is(err, modules.ErrModuleIsNotHelm) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("create helm module: %w", err)
+	}
+
+	result, err := helmModule.RenderCurrentRelease(bm.GetMaintenanceState())
+	if err != nil {
+		return nil, fmt.Errorf("render current release: %w", err)
+	}
+
+	return result, nil
+}
+
+// helmReleaseStatus returns revision and status of a Helm release. It is the
+// status source for published resources monitors and for the publisher's
+// revision reconciliation.
+func (mm *ModuleManager) helmReleaseStatus(releaseName string) (string, string, error) {
+	helmClient := mm.dependencies.Helm.NewClient(mm.logger.Named("helm-client"))
+
+	return helmClient.LastReleaseStatus(releaseName)
 }
 
 // EnsureConversionWebhooks renders the module's ConversionWebhook resources and

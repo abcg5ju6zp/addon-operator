@@ -1551,6 +1551,12 @@ const (
 	EnableScheduleBindings ModuleRunPhase = "EnableScheduleBindings"
 	// CanRunHelm - module is ready to run its Helm chart.
 	CanRunHelm ModuleRunPhase = "CanRunHelm"
+	// EnsureMonitor - the Helm run succeeded and produced a release; the
+	// resources monitor for the current release revision must be published
+	// (and confirmed to observe it) before the module becomes Ready.
+	// Retries in this phase only republish the monitor, they never re-run
+	// beforeHelm/Helm/afterHelm, which are already confirmed.
+	EnsureMonitor ModuleRunPhase = "EnsureMonitor"
 	// HooksDisabled - module has its hooks disabled (before update or deletion).
 	HooksDisabled ModuleRunPhase = "HooksDisabled"
 

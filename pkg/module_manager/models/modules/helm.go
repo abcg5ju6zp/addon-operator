@@ -60,8 +60,6 @@ type HelmValuesValidator interface {
 
 type HelmResourceManager interface {
 	GetAbsentResources(manifests []manifest.Manifest, defaultNamespace string) ([]manifest.Manifest, error)
-	StartMonitor(moduleName string, manifests []manifest.Manifest, defaultNamespace string, LastReleaseStatus func(releaseName string) (revision string, status string, err error))
-	HasMonitor(moduleName string) bool
 }
 
 type MetricsStorage interface {
@@ -168,10 +166,32 @@ func (hm *HelmModule) checkHelmValues() error {
 
 var ErrReleaseIsUnmanaged = errors.New("release is unmanaged")
 
+// HelmRunResult describes the outcome of a successful Helm run. It carries
+// everything the subsequent monitor-publishing recovery phase needs, so a
+// failure to publish the monitor is retried without ever re-running Helm.
+type HelmRunResult struct {
+	// Revision of the release that is current after the run.
+	Revision string
+	// ManifestChecksum is the moduleChecksum of the rendered manifests.
+	ManifestChecksum string
+	// RenderedManifests is the raw rendered YAML of the release manifests.
+	// The monitor publisher re-parses it on every attempt, so a manifest
+	// parsing failure after a successful upgrade only retries publishing.
+	RenderedManifests string
+	// DefaultNamespace of the module.
+	DefaultNamespace string
+	// RanUpgrade reports whether this run produced a new release revision.
+	RanUpgrade bool
+}
+
 // RunHelmInstall installs or upgrades a Helm release for the module.
 // The `state` parameter determines the maintenance state of the release:
 // - If `state` is `Unmanaged`, a release label check is triggered, and the Helm upgrade is skipped.
-func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]string, state MaintenanceState) error {
+//
+// Monitor publishing is intentionally not part of the Helm run: it is a
+// separate, independently retryable recovery phase driven by the returned
+// HelmRunResult.
+func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]string, state MaintenanceState) (*HelmRunResult, error) {
 	_, span := otel.Tracer(helmModuleServiceName).Start(ctx, "RunHelmInstall")
 	defer span.End()
 
@@ -188,7 +208,7 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 
 	err := hm.checkHelmValues()
 	if err != nil {
-		return fmt.Errorf("check helm values: %v", err)
+		return nil, fmt.Errorf("check helm values: %v", err)
 	}
 
 	// TODO Now it returns just a module name. Should it be cleaned from special symbols?
@@ -196,7 +216,7 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 
 	valuesPath, err := hm.PrepareValuesYamlFile()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.Remove(valuesPath)
 
@@ -214,7 +234,7 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 			var releaseNotFoundErr *action.ReleaseNotFoundError
 			if !errors.As(err, &releaseNotFoundErr) {
 				logEntry.Warn("get release label failed", log.Err(err), slog.String(pkg.LogKeyRelease, helmReleaseName))
-				return fmt.Errorf("get release label failed: %w", err)
+				return nil, fmt.Errorf("get release label failed: %w", err)
 			}
 
 			logEntry.Debug("release not found when checking unmanaged state", slog.String(pkg.LogKeyRelease, helmReleaseName))
@@ -223,7 +243,7 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 		if isUnmanaged == "true" {
 			logEntry.Info("helm release is Unmanaged, skip helm upgrade", slog.String(pkg.LogKeyRelease, helmReleaseName))
 
-			return ErrReleaseIsUnmanaged
+			return nil, ErrReleaseIsUnmanaged
 		}
 	}
 
@@ -264,7 +284,7 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 	}()
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	checksum := utils.CalculateStringsChecksum(renderedManifests)
@@ -274,7 +294,7 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 
 	manifests, err := manifest.ListFromYamlDocs(renderedManifests)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	logEntry.Debug("chart has resources", slog.Int(pkg.LogKeyCount, len(manifests)))
@@ -298,16 +318,14 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 	}()
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if !runUpgradeRelease {
-		// Start resources monitor if release is not changed
-		if !hm.dependencies.HelmResourceManager.HasMonitor(hm.name) {
-			hm.dependencies.HelmResourceManager.StartMonitor(hm.name, manifests, hm.defaultNamespace, helmClient.LastReleaseStatus)
-		}
-
-		return nil
+		// Release is unchanged: no Helm side effects happened. The monitor
+		// publisher reconciles the monitor against the current release
+		// (starts it when missing, otherwise just confirms the revision).
+		return hm.helmRunResult(helmClient, helmReleaseName, checksum, renderedManifests, false)
 	}
 
 	span.AddEvent("ModuleRun-HelmPhase-helm-upgrade")
@@ -334,13 +352,83 @@ func (hm *HelmModule) RunHelmInstall(ctx context.Context, logLabels map[string]s
 	}()
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Start monitor resources if release was successful
-	hm.dependencies.HelmResourceManager.StartMonitor(hm.name, manifests, hm.defaultNamespace, helmClient.LastReleaseStatus)
+	// The release was upgraded successfully. The resources monitor is
+	// published by the separate monitor-publish recovery phase, so a
+	// manifest parse or monitor start failure only retries that phase
+	// instead of re-running Helm.
+	return hm.helmRunResult(helmClient, helmReleaseName, checksum, renderedManifests, true)
+}
 
-	return nil
+// helmRunResult builds the HelmRunResult of a finished run, anchoring the
+// monitor-publish phase to the release revision that is current in the cluster.
+func (hm *HelmModule) helmRunResult(helmClient client.HelmClient, releaseName, checksum, renderedManifests string, ranUpgrade bool) (*HelmRunResult, error) {
+	revision, _, err := helmClient.LastReleaseStatus(releaseName)
+	if err != nil {
+		return nil, fmt.Errorf("get revision of release %q after helm run: %w", releaseName, err)
+	}
+
+	return &HelmRunResult{
+		Revision:          revision,
+		ManifestChecksum:  checksum,
+		RenderedManifests: renderedManifests,
+		DefaultNamespace:  hm.defaultNamespace,
+		RanUpgrade:        ranUpgrade,
+	}, nil
+}
+
+// RenderCurrentRelease renders the module chart and reads the live release
+// revision without performing any Helm mutation. The monitor-publish recovery
+// phase uses it to (re-)fetch manifests when its registered transaction is
+// missing or stale, so recovery never re-runs an already confirmed Helm task.
+func (hm *HelmModule) RenderCurrentRelease(state MaintenanceState) (*HelmRunResult, error) {
+	if err := hm.checkHelmValues(); err != nil {
+		return nil, fmt.Errorf("check helm values: %v", err)
+	}
+
+	valuesPath, err := hm.PrepareValuesYamlFile()
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(valuesPath)
+
+	helmClient := hm.dependencies.HelmClientFactory.NewClient(
+		hm.logger.Named("helm-client"),
+		helm.WithExtraLabels(hm.additionalLabels),
+	)
+
+	releaseLabels := map[string]string{
+		LabelMaintenanceNoResourceReconciliation: strconv.FormatBool(state == Unmanaged),
+	}
+
+	rendered, err := helmClient.Render(
+		hm.name,
+		hm.path,
+		[]string{valuesPath},
+		[]string{},
+		releaseLabels,
+		hm.defaultNamespace,
+		false,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	checksum := utils.CalculateStringsChecksum(rendered)
+
+	revision, _, err := helmClient.LastReleaseStatus(hm.name)
+	if err != nil {
+		return nil, fmt.Errorf("get revision of release %q: %w", hm.name, err)
+	}
+
+	return &HelmRunResult{
+		Revision:          revision,
+		ManifestChecksum:  checksum,
+		RenderedManifests: rendered,
+		DefaultNamespace:  hm.defaultNamespace,
+	}, nil
 }
 
 // If all these conditions aren't met, helm upgrade can be skipped.

@@ -21,6 +21,11 @@ type Client struct {
 	UpgradeReleaseExecuted bool
 	DeleteReleaseExecuted  bool
 	ReleaseNames           []string
+
+	// Revision and Status override the successful-release defaults returned
+	// by LastReleaseStatus ("1"/"deployed").
+	Revision string
+	Status   string
 }
 
 var _ client.HelmClient = &Client{}
@@ -34,7 +39,11 @@ func (c *Client) ListReleasesNames() ([]string, error) {
 }
 
 func (c *Client) LastReleaseStatus(_ string) (string, string, error) {
-	return "", "", nil
+	if c.Revision != "" || c.Status != "" {
+		return c.Revision, c.Status, nil
+	}
+
+	return "1", "deployed", nil
 }
 
 func (c *Client) IsReleaseExists(_ string) (bool, error) {

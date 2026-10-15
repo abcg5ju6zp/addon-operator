@@ -2,8 +2,10 @@ package helm_resources_manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 
 	"github.com/deckhouse/deckhouse/pkg/log"
@@ -17,13 +19,31 @@ import (
 	"github.com/flant/kube-client/manifest"
 )
 
+// ErrMonitorRevisionStale means a monitor swap was refused because the
+// registered monitor already serves a newer Helm release revision. A stale
+// monitor-publish transaction must never overwrite the newer monitor.
+var ErrMonitorRevisionStale = errors.New("registered monitor serves a newer release revision")
+
 type HelmResourcesManager interface {
 	WithDefaultNamespace(namespace string)
 	Stop()
 	StopMonitors()
 	PauseMonitors()
 	ResumeMonitors()
-	StartMonitor(moduleName string, manifests []manifest.Manifest, defaultNamespace string, LastReleaseStatus func(releaseName string) (revision string, status string, err error))
+	// PrepareMonitor builds a monitor and proves (via Confirm) that it observes
+	// the target release, without registering it or touching the current monitor.
+	PrepareMonitor(ctx context.Context, cfg *ResourceMonitorConfig) (*ResourcesMonitor, error)
+	// SwapMonitor atomically replaces the module's monitor. It refuses to
+	// downgrade a monitor that already serves a newer release revision.
+	SwapMonitor(moduleName string, monitor *ResourcesMonitor) error
+	// RestoreMonitor registers a monitor rebuilt from a snapshot without
+	// running Confirm, used to restore the previous watch after an interrupted
+	// replacement. It never overwrites a monitor serving an equal or newer
+	// revision.
+	RestoreMonitor(moduleName string, snapshot MonitorSnapshot, lastReleaseStatus func(releaseName string) (revision string, status string, err error)) error
+	// MonitorRevision returns the revision served by the registered monitor
+	// (empty string when the module has no monitor).
+	MonitorRevision(moduleName string) string
 	HasMonitor(moduleName string) bool
 	StopMonitor(moduleName string)
 	PauseMonitor(moduleName string)
@@ -116,29 +136,128 @@ func (hm *helmResourcesManager) Ch() chan ReleaseStatusEvent {
 	return hm.eventCh
 }
 
-func (hm *helmResourcesManager) StartMonitor(moduleName string, manifests []manifest.Manifest, defaultNamespace string, lastReleaseStatus func(releaseName string) (revision string, status string, err error)) {
-	log.Debug("Start helm resources monitor for module",
-		slog.String(pkg.LogKeyModule, moduleName))
-	hm.StopMonitor(moduleName)
+// PrepareMonitor builds a monitor for the target release and runs one
+// observation round (revision/status check, GVK resolution, cache lists)
+// without registering it or stopping the monitor currently in use.
+func (hm *helmResourcesManager) PrepareMonitor(ctx context.Context, cfg *ResourceMonitorConfig) (*ResourcesMonitor, error) {
+	log.Debug("Prepare helm resources monitor for module",
+		slog.String(pkg.LogKeyModule, cfg.ModuleName),
+		slog.String(pkg.LogKeyRevision, cfg.ReleaseRevision))
 
-	cfg := &ResourceMonitorConfig{
-		ModuleName:       moduleName,
-		Manifests:        manifests,
-		DefaultNamespace: defaultNamespace,
-		HelmStatusGetter: lastReleaseStatus,
-		AbsentCb:         hm.absentResourcesCallback,
-		KubeClient:       hm.kubeClient,
-		Cache:            hm.cache,
+	cfg.KubeClient = hm.kubeClient
+	cfg.Cache = hm.cache
+	cfg.AbsentCb = hm.absentResourcesCallback
 
-		Logger: hm.logger.Named("resource-monitor"),
+	if cfg.Logger == nil {
+		cfg.Logger = hm.logger.Named("resource-monitor")
 	}
 
 	rm := NewResourcesMonitor(hm.ctx, cfg)
 
+	if err := rm.Confirm(ctx); err != nil {
+		return nil, err
+	}
+
+	return rm, nil
+}
+
+// SwapMonitor atomically registers the prepared monitor, stopping the old one.
+// It refuses to replace a monitor that already serves a newer revision, so a
+// stale publish transaction cannot overwrite a monitor for a newer release.
+func (hm *helmResourcesManager) SwapMonitor(moduleName string, monitor *ResourcesMonitor) error {
 	hm.l.Lock()
+	defer hm.l.Unlock()
+
+	if current, ok := hm.monitors[moduleName]; ok {
+		if revisionNewer(current.ReleaseRevision(), monitor.ReleaseRevision()) {
+			return fmt.Errorf("%w: module %q has revision %q, refusing monitor for revision %q",
+				ErrMonitorRevisionStale, moduleName, current.ReleaseRevision(), monitor.ReleaseRevision())
+		}
+
+		current.Stop()
+	}
+
+	hm.monitors[moduleName] = monitor
+	monitor.Start()
+
+	log.Debug("Helm resources monitor swapped for module",
+		slog.String(pkg.LogKeyModule, moduleName),
+		slog.String(pkg.LogKeyRevision, monitor.ReleaseRevision()))
+
+	return nil
+}
+
+// RestoreMonitor rebuilds and registers a monitor from its snapshot without
+// running Confirm, restoring the previous watch after an interrupted
+// replacement. It never overwrites a monitor for an equal or newer revision.
+func (hm *helmResourcesManager) RestoreMonitor(moduleName string, snapshot MonitorSnapshot, lastReleaseStatus func(releaseName string) (revision string, status string, err error)) error {
+	hm.l.Lock()
+	defer hm.l.Unlock()
+
+	if current, ok := hm.monitors[moduleName]; ok && !revisionNewer(snapshot.ReleaseRevision, current.ReleaseRevision()) {
+		// A monitor serving the same or a newer revision is already in place.
+		return nil
+	}
+
+	cfg := &ResourceMonitorConfig{
+		ModuleName:       snapshot.ModuleName,
+		Manifests:        snapshot.Manifests,
+		DefaultNamespace: snapshot.DefaultNamespace,
+		ReleaseRevision:  snapshot.ReleaseRevision,
+		HelmStatusGetter: lastReleaseStatus,
+		AbsentCb:         hm.absentResourcesCallback,
+		KubeClient:       hm.kubeClient,
+		Cache:            hm.cache,
+		Logger:           hm.logger.Named("resource-monitor"),
+	}
+
+	rm := NewResourcesMonitor(hm.ctx, cfg)
+
+	if current, ok := hm.monitors[moduleName]; ok {
+		current.Stop()
+	}
+
 	hm.monitors[moduleName] = rm
-	hm.l.Unlock()
 	rm.Start()
+
+	log.Debug("Helm resources monitor restored for module",
+		slog.String(pkg.LogKeyModule, moduleName),
+		slog.String(pkg.LogKeyRevision, snapshot.ReleaseRevision))
+
+	return nil
+}
+
+func (hm *helmResourcesManager) MonitorRevision(moduleName string) string {
+	hm.l.RLock()
+	defer hm.l.RUnlock()
+
+	if monitor, ok := hm.monitors[moduleName]; ok {
+		return monitor.ReleaseRevision()
+	}
+
+	return ""
+}
+
+// revisionNewer reports whether revision a is newer than revision b.
+// Helm revisions are integer strings; an empty revision means "unknown" and
+// is never considered newer (so it cannot block replacement).
+func revisionNewer(a, b string) bool {
+	if a == "" {
+		return false
+	}
+
+	if b == "" {
+		return true
+	}
+
+	ai, errA := strconv.Atoi(a)
+	bi, errB := strconv.Atoi(b)
+
+	if errA == nil && errB == nil {
+		return ai > bi
+	}
+
+	return a > b
 }
 
 func (hm *helmResourcesManager) absentResourcesCallback(moduleName string, unexpectedStatus bool, absent []manifest.Manifest, defaultNs string) {

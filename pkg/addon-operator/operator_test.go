@@ -338,6 +338,9 @@ func Test_Operator_ConvergeModules_main_queue_only(t *testing.T) {
 		// Skip waiting tasks in parallel queues, proceed to schedule bindings.
 		{task.ModuleRun, "", "module-alpha", string(modules.EnableScheduleBindings)},
 		{task.ModuleRun, "", "module-alpha", string(modules.CanRunHelm)},
+		// Helm run is confirmed; the resources monitor is published by the
+		// independent EnsureMonitor recovery phase before the module is Ready.
+		{task.ModuleRun, "", "module-alpha", string(modules.EnsureMonitor)},
 
 		// ConvergeModules emerges afterAll tasks
 		{task.ConvergeModules, "", "", string(converge.WaitDeleteAndRunModules)},

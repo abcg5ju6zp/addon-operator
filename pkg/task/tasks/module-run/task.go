@@ -428,6 +428,28 @@ func (s *Task) Handle(ctx context.Context) (res queue.TaskResult) { //nolint:non
 		return res
 	}
 
+	// Independent recovery phase after a confirmed module run: publish the
+	// resources monitor for the current release. Retries never re-enter
+	// RunModule, so the already confirmed Helm release, beforeHelm and
+	// afterHelm are not executed again.
+	if baseModule.GetPhase() == modules.EnsureMonitor {
+		span.AddEvent("module ensure monitor")
+
+		s.logger.Debug("ModuleRun phase", slog.String(pkg.LogKeyPhase, string(baseModule.GetPhase())))
+
+		if err := s.moduleManager.EnsureModuleMonitor(ctx, baseModule.GetName()); err != nil {
+			moduleRunErr = err
+		} else {
+			// The new monitor is confirmed to observe the current release:
+			// only now may this convergence complete.
+			s.moduleManager.SetModulePhaseAndNotify(baseModule, modules.Ready)
+		}
+
+		res.Status = queue.Success
+
+		return res
+	}
+
 	// If the module is already in Ready state and we receive another ModuleRun task,
 	// reset it to CanRunHelm state to allow the module's Helm chart to be reapplied
 	if baseModule.GetPhase() == modules.Ready {
@@ -440,7 +462,22 @@ func (s *Task) Handle(ctx context.Context) (res queue.TaskResult) { //nolint:non
 
 		s.logger.Debug("ModuleRun phase", slog.String(pkg.LogKeyPhase, string(baseModule.GetPhase())))
 		// run beforeHelm, helm, afterHelm
-		valuesChanged, moduleRunErr = s.moduleManager.RunModule(ctx, baseModule.GetName(), s.shellTask.GetLogLabels())
+		var runResult module_manager.RunModuleResult
+		runResult, moduleRunErr = s.moduleManager.RunModule(ctx, baseModule.GetName(), s.shellTask.GetLogLabels())
+
+		if moduleRunErr == nil {
+			valuesChanged = runResult.ValuesChanged
+
+			// afterHelm changed values: another ModuleRun is queued by the
+			// defer below and re-claims the monitor transaction, so the
+			// monitor is not published for this intermediate run.
+			if !valuesChanged && runResult.NeedsMonitor {
+				s.moduleManager.SetModulePhaseAndNotify(baseModule, modules.EnsureMonitor)
+				res.Status = queue.Repeat
+
+				return res
+			}
+		}
 	}
 
 	// this is task success, but not guarantee that module in Ready phase
